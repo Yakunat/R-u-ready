@@ -1,0 +1,340 @@
+---
+title: "Linear Regression with Ames"
+author: "Yakunat"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse,readxl,caret,lubridate,psych,corrplot,car)
+ames<-read_excel("C:/Users/yakun/Documents/MSc Coursework/Ames/ames.xlsx")
+```
+
+## Introduction
+
+Real estate lies at the heart of our civilisation. On an individual level, housing is an essential human need, and on a collective one, it forms one of the most easily recognisable asset classes and the pillar of many national economies. For example, Liu and Xiong (2019) report that over 16% of China's GDP came from housing sales alone. But the value of land and property has long been debated. As Poleg (2020) narrates, Karl Marx and Adam Smith were able to agree on the position that a thing's value is a direct function of the amount of labour that is exerted to produce it and yet, Marx admitted that in that case, land should have no value since it cannot be "produced" in the typical sense. Eventually, a new school of thought put forth that value is in the eye of the beholder, as it were – a function of the utility it brings to its buyer (Poleg, 2020).
+
+Property, like other products, must be maintained to preserve its value so it can be bought or sold as a product or asset, depending on the owner's intentions. This is where the real estate agent typically comes in - to ease the process of maintaining and trading the property. But anything to be exchanged must have a price that reflects its value and requires a valuation. Real estate valuations depend on a range of features: location, condition, acreage, plus a host of subjective factors (Jowsey, 2011). Previously, one would rely on these agents for professional advice on valuation because of their privileged access to information on housing. Still, nowadays, house buyers can access the data for themselves first with sites that list house prices, like mouseprice.com or zoopla.com and now with online tools like Zillow, that estimate the value of a property using analytical methods. 
+
+## Methodology
+
+The Ames dataset is a collection of the features and sale prices of 2896 homes sold in Ames, Iowa, between 2006 – 2010. This report is an exploratory data analysis that aims (get it?) to discover which features most closely determine the value of property in that area to build a predictive model which uses linear regression to estimate the valuation of a house given some of its features as input.
+
+### Data Quality
+
+```{r Table 1: Glimpse of the Data}
+ames %>% select(Year.Built,Sale.Price,Gr.Liv.Area,Lot.Area,Bedroom.AbvGr) %>% 
+  describe()
+```
+
+Table 1 (with an impossible Year Built variable of 2025 and an extraordinarily high skew), is a snapshot of some dataset variables and reveals some quality issues. This is how they were addressed in the order below
+
+1.	Checks for uniformity, spelling errors and duplicate rows
+
+```{r DQ: Fixing spelling errors in columns, error=FALSE, warning=FALSE}
+ames <- ames %>% 
+  mutate(Neighborhood = str_replace(Neighborhood, "mes","Names")) %>% 
+  mutate(Neighborhood = str_replace(Neighborhood, "NWANames","NWAmes"))
+ames<- ames %>% 
+  mutate_at(c('Kitchen.Qual','Fireplace.Qu','Garage.Qual','Garage.Cond',
+              'Exter.Qual','Exter.Cond','Bsmt.Qual','Bsmt.Cond','Heating.QC'),funs(str_replace(.,"Good","Gd")))
+  
+```
+
+2.	Range validation: remove rows with impossible inputs (like the build year of 2025)
+
+```{r Remove impossible values, error=FALSE, warning=FALSE}
+# Remove impossible values in Year.Built, Overall Condition, Garage.Yr.Built and Overall Quality
+ggplot(ames,aes(x=Year.Built))+
+  geom_histogram()
+ames<-ames %>% filter(Year.Built<2011) %>%
+  filter(Gr.Liv.Area>=500) %>% 
+  filter(Overall.Cond<=10) %>% 
+  filter(Overall.Qual<=10) %>% 
+  filter(is.na(Garage.Yr.Blt) | Garage.Yr.Blt<2011) #extra condition to keep NAs
+ggplot(ames,aes(x=Year.Built))+
+  geom_histogram()
+```
+
+3.	Cross-validation: (like if the remodel year is earlier than the build year)
+
+```{r Cross-validation}
+
+ames<-ames %>% filter(Year.Built<=Year.Remod.Add)
+```
+
+4.	Replace NA values where possible
+
+```{r Handle NA values, error=FALSE, warning=FALSE}
+# Replace NA values with 0 in columns where NA means the feature is absent and not the data
+ames <- ames %>% 
+  mutate_at(c('Alley','Bsmt.Qual','Bsmt.Cond','Bsmt.Exposure','BsmtFin.Type.1',
+              'BsmtFin.Type.2', 'Fireplace.Qu','Garage.Type','Garage.Finish',
+              'Garage.Qual', 'Garage.Cond', 'Fence','Misc.Feature', 'Mas.Vnr.Type'), ~replace_na(.,"None"))
+
+# -- Errors in column formats and properties
+describe(ames$Garage)#empty column so it should be dropped
+ames<-ames %>% select(-Garage)
+```
+
+5.	Remove outliers that could skew the dataset and make the next stage of modelling less accurate. For the purpose of consistency, this report defines extreme values as those greater than 10x the median value of the variable.
+
+```{r Handling Outliers}
+# -- Checking for extreme outliers in key variables
+ames %>% ggplot(aes(Lot.Area))+geom_boxplot()
+ames<-ames %>% filter(Lot.Area<100000) #removing values above 10x the median
+ames %>% ggplot(aes(Lot.Area))+geom_boxplot()
+```
+
+6.	Adding any composite variables (optional)
+
+```{r Composite Variables}
+#-- Adding a composite variable Total Bath which is sum of bathrooms and half baths
+
+ames<-ames %>% 
+  mutate((TotalBath = Bsmt.Full.Bath + 0.5*Bsmt.Half.Bath + Full.Bath + 0.5*Half.Bath))
+names(ames)[80] <- "Total.Bath"
+
+# -- Adding composite variable Deck and Porch Area which is sum of decks and porches
+
+ames<-ames %>% 
+  mutate((Total.Porch = Wood.Deck.SF + Open.Porch.SF + Enclosed.Porch + X3Ssn.Porch +	Screen.Porch))
+names(ames)[81] <- "Total.Porch.SF"
+```
+
+
+
+7. Data type confirmation: if the data type is right and consistent with the definition of the variable
+
+```{r}
+# -- Replace measurements for missing features with 0
+ames <- ames %>% 
+  mutate_at(c('Total.Bath','Gr.Liv.Area','BsmtFin.SF.1','BsmtFin.SF.2','Total.Bsmt.SF', 'Garage.Cars',
+              'Garage.Area', 'Mas.Vnr.Area'), ~replace_na(.,0))
+
+# -- Changing categorical variables to factors
+ames<-ames %>% mutate_if(is.character,as.factor)
+
+# Ordering Ordinal Values
+ames$Fireplace.Qu <- ordered(ames$Fireplace.Qu,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Kitchen.Qual <- ordered(ames$Kitchen.Qual,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Exter.Cond <- ordered(ames$Exter.Cond,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Exter.Qual <- ordered(ames$Exter.Qual,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Bsmt.Cond <- ordered(ames$Bsmt.Cond,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Bsmt.Qual <- ordered(ames$Bsmt.Qual,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Garage.Cond <- ordered(ames$Garage.Cond,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Garage.Qual <- ordered(ames$Garage.Qual,levels = c('0','Po','Fa','TA','Gd','Ex'))
+ames$Heating.QC <- ordered(ames$Heating.QC,levels = c('0','Po','Fa','TA','Gd','Ex'))
+```
+
+
+All data cleaning methods adopted were geared towards keeping at least 95% of the original data. This baseline was chosen in order to maintain as much of the original distribution of the data as possible while creating a model that is accurate enough to closely predict the outcome of a large variety of inputs.
+
+## Hypothesis
+
+The housing variables can broadly be classified into four groups:
+
+* External descriptors: These are mostly character variables such as neighbourhood, building type, zoning, and slope that give an idea of the general property.
+* Features: Most of the discrete variables, like number of bathrooms, rooms, fireplaces and such, inform us of the house's features.
+* Dimensions: These are primarily the measurements of features, mostly continuous variables presented in square feet.
+* Qualifiers: The ordinals that rate the quality and condition of most features fall into this group.
+
+The first approach in forming a hypothesis was to select at least one from each variable type with the expectation that this would fully describe the property and thus get the best estimate of its value. In other words, it is a rough guide to avoid introducing the same information to the model. The first trial posits, therefore, that the neighbourhood and the year built or remodelled (from external descriptors), number of bathrooms (from the features), general living area (from dimensions), and exterior quality (from qualifiers) will be positively correlated to the sale price.
+
+## Hypothesis Testing: Visualisation
+
+A few visualisations were used to get a preliminary test of these calculated guesses which were made by taking one variable from each of the groups mentioned above and comparing it to sale price.
+In Figure 2 below, the price range per neighborhood is shown, arranged by increasing mean sale price, which indicates there may be a correlation between the two variables. This matches the common experience for most people that some properties are pricier than others simply due to their location. 
+
+```{r echo=FALSE, warning=FALSE, error=FALSE}
+## First want to rank the mean price of property in neighborhoods
+neigh_meanprice<-ames %>% group_by(Neighborhood) %>% 
+  summarise(MeanPrice=mean(Sale.Price)) %>% 
+  arrange((MeanPrice),.by_group = T)
+ames$Neighborhood<-as.factor(ames$Neighborhood)
+ames$Neighborhood <- ordered(ames$Neighborhood, levels = c('MeadowV',	'IDOTRR',	'BrDale',	'OldTown',	'BrkSide',
+                                                            'Edwards',	'SWISU',	'Sawyer',	'Landmrk',	'NPkVill',
+                                                            'Blueste',	'Names',	'Mitchel',	'SawyerW',	'NWAmes',
+                                                            'Gilbert',	'Greens',	'Blmngtn',	'CollgCr',	'ClearCr',
+                                                            'Crawfor',	'Somerst',	'Timber',	'Veenker',	'GrnHill',	'NridgHt',
+                                                            'StoneBr',	'NoRidge'))
+
+```
+
+```{r}
+#Then boxplot to show price range of property per neighborhood arranged in ascending order
+ames %>% ggplot(aes(Neighborhood,Sale.Price))+
+  geom_boxplot()+
+  theme(axis.text.x=element_text(angle=90,hjust=1))+
+  labs(y = "Sale Price ($)",title = "Fig 2:Price Range Per Neighborhood")
+```
+
+Figure 3 hints at a possible reason for this correlation - properties in the top neighborhoods were built or remodeled relatively recently and therefore their higher value may be attached to their newness.
+
+```{r}
+#Possible reason why Neighborhood affects price: Newer houses
+ames %>% ggplot(aes(Neighborhood,Year.Remod.Add))+
+  geom_count() + 
+  theme(axis.text.x=element_text(angle=90,hjust=1))+
+  labs(title="Fig 3:Neighborhoods and Remodeling", 
+       subtitle="In-demand Neighborhoods likely to have more recent remodels",
+       caption="Source: Ames",
+       x="Neighborhoods",y="Year Remodeled")
+```
+
+The next is a test of the effect of an extra feature on sale price – in this case bathrooms (note: both half baths and full baths were summed to create a total bathroom count variable). Figure 4 shows that the correlation is positively linear, but only within a specific interval – after 4.5 bathrooms, the effect becomes less predictable. 
+
+```{r}
+ames %>% group_by(Total.Bath) %>% 
+  summarise(Meanprice=mean(Sale.Price)) %>% 
+  ggplot(aes(Total.Bath,Meanprice))+
+  geom_col()+
+  labs(y = "Average Sale Price ($)",x="Total Number of Bathrooms",
+       title = "Fig 4: People Want More Bathrooms",
+       subtitle = "...Until they dont")
+```
+
+This is followed by Figure 5 which reveals a correlation between increased above ground living area (a dimension-type variable) and sale price. 
+
+```{r}
+#Living Area
+ames %>% ggplot(aes(Gr.Liv.Area,Sale.Price))+
+  geom_point(shape="diamond")+
+  labs(y="Sale Price ($)", x='General Living Area (sqft)',
+       title = 'Fig 5: The Bigger the Better')+
+  geom_smooth(method = 'lm',se=FALSE)
+```
+
+Figure 6 seems to confirm that quality ratings matter to buyers as it shows that the average sale price increases with better exterior quality.
+
+```{r}
+ames %>% group_by(Exter.Qual) %>% 
+  summarise(MeanPrice=mean(Sale.Price)) %>% 
+  ggplot(aes(x=as.factor(Exter.Qual),y=MeanPrice))+ 
+  geom_col()+
+  labs(x="Quality of Exterior", y="Average Sale Price($)", 
+       title = "Fig 6: Exterior Quality Effect on Price")
+```
+
+## Correlations and Linear Regression
+
+To test the statistical relevance of these hypotheses, correlation tests were carried out between each of the first ten selected independent variables against the dependent variable, which is the sale price. Key metrics of the correlation tests and linear regression models are summarised in Table 2 below, with the independent variables ranked by R-squared measure. The correlation sub-table shows the statistical significance of the variable, while the post-resample presents the prediction performance of each variable when used in simple linear regression.
+
+```{r}
+set.seed(40381881)
+index<-createDataPartition(ames$Sale.Price,times = 1,p=0.8,list = F)
+train<-ames[index,]
+test<-ames[-index,]
+```
+
+```{r eval=FALSE, echo=FALSE}
+model1<-lm(formula = Sale.Price~Gr.Liv.Area,data = train)
+model2<-lm(formula = Sale.Price~Total.Bath,data = train)
+model3<-lm(formula = Sale.Price~Exter.Qual,data = train)
+model4<-lm(formula = Sale.Price~TotRms.AbvGrd,data = train)
+model5<-lm(formula = Sale.Price~as.factor(Neighborhood),data = train)
+model6<-lm(formula = Sale.Price~Year.Remod.Add,data = train)
+model7<-lm(formula = Sale.Price~Overall.Qual,data = train)
+model8<-lm(formula = Sale.Price~Kitchen.Qual,data = train)
+model9<-lm(Sale.Price~Overall.Cond,data = train)
+model10<-lm(Sale.Price~Garage.Area,data = train)
+
+summary(model1)
+model1_predict<- predict(model1, newdata = test)
+postResample(model1_predict, test$Sale.Price)
+
+summary(model2)
+model2_predict<- predict(model2, newdata = test)
+postResample(model2_predict, test$Sale.Price)
+
+summary(model3)
+model3_predict<- predict(model3, newdata = test)
+postResample(model3_predict, test$Sale.Price)
+
+summary(model4)
+model4_predict<- predict(model4, newdata = test)
+postResample(model4_predict, test$Sale.Price)
+
+summary(model5)
+model5_predict<- predict(model5, newdata = test)
+postResample(model5_predict, test$Sale.Price)
+
+summary(model6)
+model6_predict<- predict(model6, newdata = test)
+postResample(model6_predict, test$Sale.Price)
+
+summary(model7)
+model7_predict<- predict(model7, newdata = test)
+postResample(model7_predict, test$Sale.Price)
+
+summary(model8)
+model8_predict<- predict(model8, newdata = test)
+postResample(model8_predict, test$Sale.Price)
+
+summary(model9)
+model9_predict<- predict(model9, newdata = test)
+postResample(model9_predict, test$Sale.Price)
+
+summary(model10)
+model10_predict<- predict(model10, newdata = test)
+postResample(model10_predict, test$Sale.Price)
+```
+
+
+![Table 2: Single-variable performance measures on train and test data](C:/Users\yakun\Documents\MSc Coursework\Ames\SVP linear regression table.png)
+## Multiple Linear Regression
+
+Starting with the top five variables that best predicted the dependent variable, a number of multiple linear regression models were built and their performance was measured and summarised as shown in Table 3 below. After producing each model, it is tested for predictive accuracy, and then for assumptions. As seen in ‘multimodel1’, the Neighbourhood variable was dropped after the first trial. This is because it showed troubling measures of multicollinearity with a variable inflation factor (VIF) of 27.
+
+![Testing Multiple Regression Models](C:/Users\yakun\Documents\MSc Coursework\Ames\multimodel table.png)
+
+A correlation matrix was developed in R to highlight which other variables were highly correlated so as to avoid combining them in subsequent models. 
+```{r Tests for Multi-collinearity, eval=FALSE}
+ames1_num <- select_if(ames, is.numeric)
+cor_ames_num <-cor(ames1_num)
+cor_ames_num[lower.tri(cor_ames_num,diag = TRUE)] <- NA 
+cor_ames_num[cor_ames_num == 1]<-NA
+cor_ames_num
+
+ames1_fac <- select_if(ames, is.factor)
+ames1_fac<-ames1_fac %>% mutate_if(is.factor,as.numeric)
+cor_ames_fac <-cor(ames1_fac)
+cor_ames_fac[lower.tri(cor_ames_fac,diag = TRUE)] <- NA 
+cor_ames_fac[cor_ames_fac == 1]<-NA
+cor_ames_fac
+```
+
+This was how each model was selected: introduce a new variable, test the model’s performance and adjust and if it passes, add a new variable for the next model. The model labelled ‘multimodel5’ which featured 9 variables produced an R-squared value of 0.76 which had the highest measure of predictive accuracy from numerous trial models. 
+After selecting the model with the highest predictive accuracy (referenced as multimodel5), a number of tests were conducted to examine the assumptions. The summary of the model’s characteristics are shown below.
+
+```{r Final Model Selection}
+library(lmtest)
+multimodel5<- lm(formula = Sale.Price~Overall.Qual+Overall.Cond+Bldg.Type
+                   +Gr.Liv.Area+Exter.Qual+Kitchen.Qual+Year.Built+Garage.Cars+Mo.Sold,data=train)
+multimodel5_predict<- predict(multimodel5, newdata = test)
+postResample(multimodel5_predict, test$Sale.Price)
+dwtest(multimodel5)
+vif(multimodel5)
+mean(vif(multimodel5))
+```
+
+In the Durbin-Watson test, the selected model scored 1.61 which shows that the errors/residuals are not significantly correlated while the p-value of less than 2e-16 proved that the test is significant. The VIF test values fall within the acceptable range of less than 5 – both for each individual variable and the combined mean. As mentioned earlier, a previous test for multicollinearity revealed one value of 27 related to the Neighbourhood variable which is sub-optimal. Bowman et al (2012) concluded that residents of Ames were willing to pay higher for properties near public parks, forests and water features, based on their survey of respondents in the area and an analytical price model. This is in line with the visualisation presented in Figure 2 which shows that the effect of neighbourhood on sale price is significant but it is clear that the information it gives relates too strongly with other information in the model probably due to houses in the same area having similar features if they were built around the same time by the same developer. 
+
+Below in Figures 8-11 are the plots that quantify the final model’s performance.  Figure 8 shows how the difference between the predicted values on the line and the actual plotted value points. A perfectly normal distribution will all fall on the y = 0 line and by observation, most points fall within the line but there are a couple huge outliers. Figure 9 with standardised residuals is a heteroscedasticity check. Since the data points are randomly scattered around the line, it is acceptable but ideally it would be better if the line was more horizontal than curved. Three outlier points are labelled in most model plots. Like the word leverage in Figure 10 implies, Cook’s distance measures how far-lying data points shift the weight distribution of the model’s data – the closer a point is to 1, the greater influence it exerts. The objective of the Q-Q plot is to compare the residual distribution to a normal distribution (represented by the diagonal line).
+
+```{r Assessing Final Model}
+
+plot(multimodel5)
+
+```
+
+## Conclusions
+
+The model in this report was designed to predict as closely as possible the sale price when provided with a number of key input variables. The final model produced was about 76% accurate which implies that 3 out of 4 predictions would typically be correct. Further studies could produce more precise findings. It is not clear why these are the specific variables that have the most influence on the sale price. As was mentioned in the opening paragraph, valuations have both objective and subjective elements to them and the determinants of value will vary with each region and time frame. 
+
+
+## Reflections
+
+In this project, the workflow optimised for finding the model with the highest measures of predictive performance before assessing if the top performing models violated the statistical assumptions. Eventually, only some aspects of the initial hypothesis held true by the end of the exercise. However, it is clear that with better techniques, it is easier to make more accurate guesses by eliminating outliers and other distractors. The major learning from this exploration of linear regression is the importance of domain knowledge to improve the quality of questions an analyst asks of the data and the importance of a good workflow that is agile and iterative so that the model can be continuously optimized until the desired outcome is reached. A strong foundation in statistics is also vital in order to understand the reasons behind certain observed features and behaviours. Overall, this forms a good foundation for further exercises.
+
